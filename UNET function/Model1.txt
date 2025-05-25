@@ -1,0 +1,14 @@
+Epoch 0
+Epoch 1
+Epoch 2
+Epoch 3
+Epoch 4
+Epoch 5
+Epoch 6
+Epoch 7
+Epoch 8
+Epoch 9
+Runtime: 241.85 seconds
+Validation PSNR: 28.64
+Validation SSIM: 0.9040
+Validation MSE: 0.002128

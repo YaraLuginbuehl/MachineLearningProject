@@ -1,75 +1,82 @@
-# All necessary imports
+# -*- coding: utf-8 -*-
+# === Imports ===
 import numpy as np
+import numpy.ma as ma
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import pandas as pd
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import KFold
 from pytorch_msssim import ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr, structural_similarity as ssim_metric, mean_squared_error as mse
+from datetime import datetime
 import os
 import time
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Define the Transformer-based denoiser
+# === Transformer Model Definition ===
 class TransformerDenoiser(nn.Module):
-    def __init__(self, img_size=64, patch_size=8, emb_dim=256, num_layers=4, num_heads=8):
+    def __init__(self, img_size=128, patch_size=8, emb_dim=256, num_heads=8, num_layers=4):
         super().__init__()
-        assert img_size % patch_size == 0, "img_size must be divisible by patch_size"
-
         self.img_size = img_size
         self.patch_size = patch_size
+        self.patch_dim = patch_size * patch_size
+        self.emb_dim = emb_dim
         self.num_patches = (img_size // patch_size) ** 2
-        self.patch_dim = patch_size * patch_size  # grayscale image (1 channel)
 
         self.linear_proj = nn.Linear(self.patch_dim, emb_dim)
-        self.positional_embedding = nn.Parameter(torch.randn(1, self.num_patches, emb_dim))
+        self.pos_embedding = nn.Parameter(torch.randn(1, self.num_patches, emb_dim))
 
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=emb_dim, nhead=num_heads, dim_feedforward=512, batch_first=True
-        )
+        encoder_layer = nn.TransformerEncoderLayer(d_model=emb_dim, nhead=num_heads, dim_feedforward=512, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.output_proj = nn.Linear(emb_dim, self.patch_dim)
 
-        # Optional convolutional refinement after patch reconstruction
-        self.refine = nn.Sequential(
-            nn.Conv2d(1, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 1, 3, padding=1)
-        )
-
     def forward(self, x):
         B, C, H, W = x.shape
-        assert H == self.img_size and W == self.img_size, "Input image size must match model image size"
+        assert H == self.img_size and W == self.img_size
 
-        # Unfold into patches
-        x = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
-        x = x.contiguous().view(B, C, -1, self.patch_size, self.patch_size)
-        x = x.permute(0, 2, 3, 4, 1).reshape(B, -1, self.patch_dim)  # (B, num_patches, patch_dim)
+        patches = x.unfold(2, self.patch_size, self.patch_size).unfold(3, self.patch_size, self.patch_size)
+        patches = patches.contiguous().permute(0, 2, 3, 1, 4, 5).reshape(B, -1, self.patch_dim)
 
-        x = self.linear_proj(x) + self.positional_embedding  # (B, num_patches, emb_dim)
-        x = self.transformer(x)  # (B, num_patches, emb_dim)
-        x = self.output_proj(x)  # (B, num_patches, patch_dim)
+        emb = self.linear_proj(patches) + self.pos_embedding[:, :patches.shape[1], :]
+        encoded = self.transformer(emb)
+        decoded = self.output_proj(encoded)
 
-        x = x.view(B, self.img_size // self.patch_size, self.img_size // self.patch_size,
-                   self.patch_size, self.patch_size)
-        x = x.permute(0, 1, 3, 2, 4).reshape(B, 1, H, W)  # Back to image
-        x = self.refine(x)
-        return x
+        decoded = decoded.view(B, H // self.patch_size, W // self.patch_size, 1, self.patch_size, self.patch_size)
+        decoded = decoded.permute(0, 3, 1, 4, 2, 5).contiguous()
+        out = decoded.view(B, 1, H, W)
 
-# Normalization
+        return torch.sigmoid(out)
+
+# === Helper Functions ===
 def normalize_data(data):
-    data_min, data_max = data.min(), data.max()
-    return (data - data_min) / (data_max - data_min)
+    return (data - data.min()) / (data.max() - data.min())
 
-# Hybrid loss
-l1 = nn.L1Loss()
 def hybrid_loss(pred, target):
+    l1 = nn.L1Loss()
     return 0.85 * l1(pred, target) + 0.15 * (1 - ssim(pred, target, data_range=1.0, size_average=True))
 
-# Train loop
+def save_prediction_data(noisy, clean, pred, fold, index):
+    os.makedirs("transformer_predictions", exist_ok=True)
+    np.save(f"transformer_predictions/noisy_fold{fold}_idx{index}.npy", noisy[index, 0])
+    np.save(f"transformer_predictions/clean_fold{fold}_idx{index}.npy", clean[index, 0])
+    np.save(f"transformer_predictions/pred_fold{fold}_idx{index}.npy", pred[index, 0])
+
+def plot_comparison(noisy, clean, pred, index, tag, fold):
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    axs[0].imshow(noisy[index, 0], cmap='gray'); axs[0].set_title("Noisy")
+    axs[1].imshow(clean[index, 0], cmap='gray'); axs[1].set_title("Clean")
+    axs[2].imshow(pred[index, 0], cmap='gray'); axs[2].set_title("Denoised")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"transformer_{tag}_sample_{index:02d}_fold{fold}_{timestamp}.png"
+    plt.savefig(fname)
+    plt.close()
+
+# === Training Routine ===
 def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001):
     optimizer = optim.Adam(model.parameters(), lr=lr)
     train_losses, val_losses = [], []
@@ -98,22 +105,12 @@ def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001):
 
     return model, train_losses, val_losses
 
-# Plot comparison images
-def plot_comparison(noisy, clean, pred, index, tag):
-    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
-    axs[0].imshow(noisy[index, 0], cmap='gray')
-    axs[0].set_title("Noisy")
-    axs[1].imshow(clean[index, 0], cmap='gray')
-    axs[1].set_title("Clean")
-    axs[2].imshow(pred[index, 0], cmap='gray')
-    axs[2].set_title("Denoised")
-    plt.savefig(f"transformer_comparison_{tag}_sample_{index:02d}.png")
-    plt.close()
-
-# Cross-validation
-def cross_validate_transformer(noisy_data, clean_data, k=5):
+# === Cross-Validation Routine ===
+def cross_validate_model(noisy_data, clean_data, k=5):
     kf = KFold(n_splits=k, shuffle=True, random_state=42)
     all_train, all_val = [], []
+    loss_records = []
+    mse_list, psnr_list, ssim_list = [], [], []
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(noisy_data)):
         print(f"Fold {fold + 1}/{k}")
@@ -128,44 +125,75 @@ def cross_validate_transformer(noisy_data, clean_data, k=5):
         train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=64)
 
-        model = TransformerDenoiser(img_size=64, patch_size=8).to(device)
-        _, train_loss, val_loss = train_model(model, train_loader, val_loader, num_epochs=10)
+        model = TransformerDenoiser().to(device)
+        _, train_loss, val_loss = train_model(model, train_loader, val_loader)
         all_train.append(train_loss)
         all_val.append(val_loss)
 
+        for epoch in range(len(train_loss)):
+            loss_records.append({
+                'Fold': fold + 1,
+                'Epoch': epoch + 1,
+                'Train Loss': train_loss[epoch],
+                'Val Loss': val_loss[epoch]
+            })
+
         if fold == 0:
             model.eval()
-            val_samples = next(iter(val_loader))[0].to(device)
-            preds = model(val_samples).detach().cpu().numpy()
-            plot_comparison(noisy_data[val_idx], clean_data[val_idx], preds, 0, tag="val")
-            plot_comparison(noisy_data[val_idx], clean_data[val_idx], preds, 1, tag="val")
-            train_samples = next(iter(train_loader))[0].to(device)
-            preds_train = model(train_samples).detach().cpu().numpy()
-            plot_comparison(noisy_data[train_idx], clean_data[train_idx], preds_train, 0, tag="train")
-            plot_comparison(noisy_data[train_idx], clean_data[train_idx], preds_train, 1, tag="train")
+            val_inputs, val_targets = next(iter(val_loader))
+            val_inputs, val_targets = val_inputs.to(device), val_targets.to(device)
+            preds_val = model(val_inputs).detach().cpu().numpy()
+            val_inputs_cpu = val_inputs.cpu().numpy()
+            val_targets_cpu = val_targets.cpu().numpy()
+            for i in range(4):
+                save_prediction_data(val_inputs_cpu, val_targets_cpu, preds_val, fold, i)
+                plot_comparison(val_inputs_cpu, val_targets_cpu, preds_val, i, tag="val", fold=fold)
 
-    # Plot average loss curves
-    avg_train = np.mean(all_train, axis=0)
-    avg_val = np.mean(all_val, axis=0)
-    plt.plot(avg_train, label="Train Loss")
-    plt.plot(avg_val, label="Validation Loss")
-    plt.title("Transformer Model Performance")
+        model.eval()
+        val_inputs, val_targets = next(iter(val_loader))
+        val_inputs, val_targets = val_inputs.to(device), val_targets.to(device)
+        preds = model(val_inputs).detach().cpu().numpy()
+        val_targets = val_targets.cpu().numpy()
+        mse_score = np.mean([mse(val_targets[i, 0], preds[i, 0]) for i in range(min(4, len(preds)))])
+        psnr_score = np.mean([psnr(val_targets[i, 0], preds[i, 0], data_range=1.0) for i in range(min(4, len(preds)))])
+        ssim_score = np.mean([ssim_metric(val_targets[i, 0], preds[i, 0], data_range=1.0) for i in range(min(4, len(preds)))])
+        mse_list.append(mse_score)
+        psnr_list.append(psnr_score)
+        ssim_list.append(ssim_score)
+
+        print(f"Fold {fold} MSE: {mse_score}")
+        print(f"Fold {fold} PSNR: {psnr_score}")
+        print(f"Fold {fold} SSIM: {ssim_score}")
+
+    print("\n=== Transformer Model Final Metrics ===")
+    print(f"Avg MSE: {np.mean(mse_list):.6f} +/- {np.std(mse_list):.6f}")
+    print(f"Avg PSNR: {np.mean(psnr_list):.2f} +/- {np.std(psnr_list):.2f}")
+    print(f"Avg SSIM: {np.mean(ssim_list):.4f} +/- {np.std(ssim_list):.4f}")
+
+    max_epochs = max(len(l) for l in all_train)
+    def pad(l): return l + [np.nan] * (max_epochs - len(l))
+    train_matrix = np.array([pad(l) for l in all_train])
+    val_matrix = np.array([pad(l) for l in all_val])
+    mean_train = ma.masked_invalid(train_matrix).mean(axis=0)
+    mean_val = ma.masked_invalid(val_matrix).mean(axis=0)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plt.plot(mean_train, label="Train Loss")
+    plt.plot(mean_val, label="Validation Loss")
+    plt.title("Transformer Loss (Mean across folds)")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
-    plt.savefig("transformer_loss_comparison.png")
+    plt.savefig(f"transformer_loss_mean_{timestamp}.png")
     plt.close()
 
-# MAIN
+# === Main ===
 if __name__ == "__main__":
-    print("Using device =", device)
+    print("==== Script started ====")
     noisy_data = np.load("noisy_train_19k.npy").astype(np.float32)
     clean_data = np.load("clean_train_19k.npy").astype(np.float32)
-
     noisy_data = normalize_data(noisy_data)
     clean_data = normalize_data(clean_data)
-
     start = time.time()
-    cross_validate_transformer(noisy_data, clean_data, k=5)
-    end = time.time()
-    print("Total training time:", end - start, "seconds")
+    cross_validate_model(noisy_data, clean_data, k=5)
+    print("Total time:", time.time() - start, "seconds")

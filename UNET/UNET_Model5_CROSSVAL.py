@@ -1,21 +1,21 @@
-# MODEL 1
+# MODEL 5
 
-from .CNN_FUNCTION_CROSSVAL import CNN_FUNCTION
+from UNET_CROSSVAL import UNET_FUNCTION
 
-results = CNN_FUNCTION(
-    noisy_data_path="/cluster/home/yluginbuehl/Denoising_2D/noisy_train_19k.npy",
-    clean_data_path="/cluster/home/yluginbuehl/Denoising_2D/clean_train_19k.npy",        
-    activation='relu',
-    num_layers=2, 
+
+results = UNET_FUNCTION(
+    noisy_data_path="/cluster/home/yluginbuehl/Denoising_2D/UNET/noisy_train_19k.npy",
+    clean_data_path="/cluster/home/yluginbuehl/Denoising_2D/UNET/clean_train_19k.npy",
+    num_layers=2,
+    activation='leaky_relu',
     optimizer_type='adam',
-    learning_rate=0.0005,
-    n_splits=5  # Enable cross-validation
+    learning_rate=0.001,
+    n_splits=5  # Make sure to set this for cross-validation
 )
 
 import matplotlib.pyplot as plt
 import numpy as np
 
-# Plot and print results for each fold
 for fold_result in results:
     fold = fold_result["fold"]
     print(f"\n=== Fold {fold} ===")
@@ -37,8 +37,8 @@ for fold_result in results:
         plt.title(title)
         plt.axis("off")
     plt.tight_layout()
-    plt.suptitle(f"Model 1 - Fold {fold}")
-    plt.savefig(f"/cluster/home/yluginbuehl/Denoising_2D/CNN/Model1/Model1_CNN_Image_Fold{fold}")
+    plt.suptitle(f"Model 5 - Fold {fold}")
+    plt.savefig(f"/cluster/home/yluginbuehl/Denoising_2D/UNET/Model5/Model5_UNET_Image_Fold{fold}")
 
     plt.figure(figsize=(8,5))
     plt.plot(fold_result['loss_history'], label='Train Loss')
@@ -48,9 +48,8 @@ for fold_result in results:
     plt.title(f'Training and Validation Loss - Fold {fold}')
     plt.legend()
     plt.grid(True)
-    plt.savefig(f"/cluster/home/yluginbuehl/Denoising_2D/CNN/Model1/Model1_CNN_Loss_Fold{fold}")
+    plt.savefig(f"/cluster/home/yluginbuehl/Denoising_2D/UNET/Model5/Model5_UNET_Loss_Fold{fold}")
 
-# Calculate mean and std for metrics across folds
 psnr_list = [fold_result['validation']['psnr'] for fold_result in results]
 ssim_list = [fold_result['validation']['ssim'] for fold_result in results]
 mse_list = [fold_result['validation']['mse'] for fold_result in results]

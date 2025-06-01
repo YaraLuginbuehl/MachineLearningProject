@@ -1,10 +1,11 @@
 def UNET_FUNCTION(
     noisy_data_path,
     clean_data_path,
-    features=32,
     num_layers=3,
     activation='relu',
-    bottleneck_size=128
+    optimizer_type='adamw',
+    learning_rate=0.0005,
+    n_splits=5  # New argument for number of folds
 ):
     import numpy as np
     import torch
@@ -16,6 +17,7 @@ def UNET_FUNCTION(
     from skimage.metrics import peak_signal_noise_ratio as psnr
     from skimage.metrics import structural_similarity as ssim
     from sklearn.metrics import mean_squared_error
+    from sklearn.model_selection import KFold
     import os
 
     os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -28,13 +30,27 @@ def UNET_FUNCTION(
         torch.backends.cudnn.benchmark = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
+    features = 32
+    bottleneck_size = 128
+
     def get_activation(act):
         return {
             'relu': nn.ReLU(),
             'leaky_relu': nn.LeakyReLU(),
             'elu': nn.ELU()
         }.get(act.lower(), nn.ReLU())
+
+    def get_optimizer(model, optimizer_type, learning_rate):
+        opt = optimizer_type.lower()
+        if opt == 'adam':
+            return optim.Adam(model.parameters(), lr=learning_rate)
+        elif opt == 'adamw':
+            return optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-5)
+        elif opt == 'sgd':
+            return optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9)
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer_type}")
 
     class UNetDynamic(nn.Module):
         def __init__(self, features, num_layers, bottleneck_size, activation):
@@ -109,9 +125,8 @@ def UNET_FUNCTION(
 
     def train_model(train_loader, val_loader, model):
         criterion = nn.MSELoss()
-        optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
-        num_epochs = 10
+        optimizer = get_optimizer(model, optimizer_type, learning_rate)
+        num_epochs = 50
         loss_history = []
         loss_history_val = []
 
@@ -141,75 +156,83 @@ def UNET_FUNCTION(
                     val_loss += criterion(outputs, targets).item()
             val_loss /= len(val_loader)
             loss_history_val.append(val_loss)
-            scheduler.step(val_loss)
 
         return model, loss_history, loss_history_val
 
     def validation(clean, predicted):
         psnr_list, ssim_list, mse_list = [], [], []
         for i in range(len(clean)):
-            gt = clean[i, 0].cpu().numpy().astype(np.float32)  # assuming clean is still a tensor
-            pred = predicted[i, 0].astype(np.float32)  
-        
+            gt = clean[i, 0].astype(np.float32)
+            pred = predicted[i, 0].astype(np.float32)
             psnr_list.append(psnr(gt, pred, data_range=1.0))
             ssim_list.append(ssim(gt, pred, data_range=1.0))
             mse_list.append(mean_squared_error(gt, pred))
         return np.mean(psnr_list), np.mean(ssim_list), np.mean(mse_list)
 
-    # Load and normalize data
     noisy_data = np.load(noisy_data_path)
     clean_data = np.load(clean_data_path)
     noisy_profiles_norm = normalize_data(noisy_data)
     clean_profiles_norm = normalize_data(clean_data)
 
-    # Prepare tensors
     noisy_tensor = torch.from_numpy(noisy_profiles_norm).unsqueeze(1).float()
     clean_tensor = torch.from_numpy(clean_profiles_norm).unsqueeze(1).float()
     dataset = TensorDataset(noisy_tensor, clean_tensor)
 
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    generator = torch.Generator().manual_seed(42)  
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    indices = np.arange(len(dataset))
+    results = []
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
+    for fold, (train_idx, val_idx) in enumerate(kf.split(indices)):
+        print(f"\n--- Fold {fold+1}/{n_splits} ---")
+        train_subset = torch.utils.data.Subset(dataset, train_idx)
+        val_subset = torch.utils.data.Subset(dataset, val_idx)
 
-    model = UNetDynamic(features, num_layers, bottleneck_size, activation).to(device)
+        train_loader = DataLoader(train_subset, batch_size=32, shuffle=True)
+        val_loader = DataLoader(val_subset, batch_size=32)
 
-    start_time = time.time()
-    model, loss_history, val_loss_history = train_model(train_loader, val_loader, model)
-    runtime = time.time() - start_time
+        model = UNetDynamic(features, num_layers, bottleneck_size, activation).to(device)
 
-    # Predict
-    model.eval()
-    predicted_profiles = []
-    with torch.no_grad():
-        for noisy, _ in val_loader:
-            noisy = noisy.to(device)
-            predicted = model(noisy)
-            predicted_profiles.append(predicted.cpu())
-    predicted_profiles = torch.cat(predicted_profiles, dim=0).cpu().numpy()
+        start_time = time.time()
+        model, loss_history, val_loss_history = train_model(train_loader, val_loader, model)
+        runtime = time.time() - start_time
 
-    # Metrics
-    avg_psnr, avg_ssim, avg_mse = validation(val_dataset[:][1], predicted_profiles)
+        model.eval()
+        predicted_profiles = []
+        with torch.no_grad():
+            for noisy, _ in val_loader:
+                noisy = noisy.to(device)
+                predicted = model(noisy)
+                predicted_profiles.append(predicted.cpu())
+        predicted_profiles = torch.cat(predicted_profiles, dim=0).cpu().numpy()
 
-    # Sample image
-    idx = 30
-    noisy_sample = val_dataset[:][0][idx,0]
-    clean_sample = val_dataset[:][1][idx,0]
-    pred_sample = predicted_profiles[idx,0]
+        val_noisy, val_clean = [], []
+        for i in range(len(val_subset)):
+            n, c = val_subset[i]
+            val_noisy.append(n.numpy())
+            val_clean.append(c.numpy())
+        val_noisy = np.stack(val_noisy)
+        val_clean = np.stack(val_clean)
 
-    return {
-        "predicted_image": pred_sample,
-        "clean_image": clean_sample,
-        "noisy_image": noisy_sample,
-        "runtime_sec": runtime,
-        "validation": {
-            "psnr": avg_psnr,
-            "ssim": avg_ssim,
-            "mse": avg_mse,
-        },
-        "loss_history": loss_history,
-        "val_loss_history": val_loss_history
-    }
+        avg_psnr, avg_ssim, avg_mse = validation(val_clean, predicted_profiles)
+
+        idx = min(30, len(val_subset)-1)
+        noisy_sample = val_noisy[idx, 0]
+        clean_sample = val_clean[idx, 0]
+        pred_sample = predicted_profiles[idx, 0]
+
+        results.append({
+            "fold": fold+1,
+            "predicted_image": pred_sample,
+            "clean_image": clean_sample,
+            "noisy_image": noisy_sample,
+            "runtime_sec": runtime,
+            "validation": {
+                "psnr": avg_psnr,
+                "ssim": avg_ssim,
+                "mse": avg_mse,
+            },
+            "loss_history": loss_history,
+            "val_loss_history": val_loss_history
+        })
+
+    return results

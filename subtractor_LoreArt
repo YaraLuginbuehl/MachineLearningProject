@@ -1,0 +1,25 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+base_path = r"C:\Users\loren\Desktop\Uni-Ordner\Master\Space Systems\SpaceData\HORUS_denoising\OpenProject\hybrid_predictions"
+
+idx = 1
+fold = 0
+
+# Correct filenames based on saved format
+clean = np.load(f"{base_path}/clean_fold{fold}_idx{idx}.npy")
+pred = np.load(f"{base_path}/pred_hybrid_fold{fold}_idx{idx}.npy")
+
+
+# Compute pixel-wise difference
+diff = clean - pred
+
+# Plot heatmap
+vmax = np.max(np.abs(diff))
+plt.imshow(diff, cmap='seismic', vmin=-vmax, vmax=vmax)
+plt.colorbar(label="Pixel Difference")
+plt.title(f"Difference Map: Clean - Hybrid (Fold {fold}, Index {idx})")
+plt.axis('off')
+plt.tight_layout()
+plt.savefig(f"{base_path}/diffmap_hybrid_fold{fold}_idx{idx}.png", dpi=150)
+plt.show()
